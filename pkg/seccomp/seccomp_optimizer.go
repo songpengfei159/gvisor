@@ -14,6 +14,11 @@
 
 package seccomp
 
+import (
+	"fmt"
+	"strings"
+)
+
 // ruleOptimizerFunc is a function type that can optimize a SyscallRule.
 // It returns the updated SyscallRule, along with whether any modification
 // was made.
@@ -99,6 +104,364 @@ func convertMatchAllAndXToX(rule SyscallRule) (SyscallRule, bool) {
 	return And(newRules), true
 }
 
+// nilInPerArgToAnyValue replaces `nil` values in `PerArg` rules with
+// `AnyValue`. This isn't really an optimization, but it simplifies the
+// logic of other `PerArg` optimizers to not have to handle the `nil` case
+// separately from the `AnyValue` case.
+func nilInPerArgToAnyValue(rule SyscallRule) (SyscallRule, bool) {
+	perArg, isPerArg := rule.(PerArg)
+	if !isPerArg {
+		return rule, false
+	}
+	changed := false
+	for argNum, valueMatcher := range perArg {
+		if valueMatcher == nil {
+			perArg[argNum] = AnyValue{}
+			changed = true
+		}
+	}
+	return perArg, changed
+}
+
+// convertUselessPerArgToMatchAll looks for `PerArg` rules that match
+// anything and replaces them with `MatchAll`.
+func convertUselessPerArgToMatchAll(rule SyscallRule) (SyscallRule, bool) {
+	perArg, isPerArg := rule.(PerArg)
+	if !isPerArg {
+		return rule, false
+	}
+	for _, valueMatcher := range perArg {
+		if _, isAnyValue := valueMatcher.(AnyValue); !isAnyValue {
+			return rule, false
+		}
+	}
+	return MatchAll{}, true
+}
+
+// signature returns a string signature of this `PerArg`.
+// This string can be used to identify the behavior of this `PerArg` rule.
+func (pa PerArg) signature() string {
+	var sb strings.Builder
+	for _, valueMatcher := range pa {
+		repr := valueMatcher.Repr()
+		if strings.ContainsRune(repr, ';') {
+			panic(fmt.Sprintf("ValueMatcher %v (type %T) returned representation %q containing illegal character ';'", valueMatcher, valueMatcher, repr))
+		}
+		sb.WriteString(repr)
+		sb.WriteRune(';')
+	}
+	return sb.String()
+}
+
+// deduplicatePerArgs deduplicates PerArg rules with identical matchers.
+// This can happen during filter construction, when rules are added across
+// multiple files.
+func deduplicatePerArgs[T Or | And](rule SyscallRule) (SyscallRule, bool) {
+	tRule, isT := rule.(T)
+	if !isT || len(tRule) < 2 {
+		return rule, false
+	}
+	knownPerArgs := make(map[string]struct{}, len(tRule))
+	newRules := make([]SyscallRule, 0, len(tRule))
+	changed := false
+	for _, subRule := range tRule {
+		subPerArg, subIsPerArg := subRule.(PerArg)
+		if !subIsPerArg {
+			newRules = append(newRules, subRule)
+			continue
+		}
+		sig := subPerArg.signature()
+		if _, isDupe := knownPerArgs[sig]; isDupe {
+			changed = true
+			continue
+		}
+		knownPerArgs[sig] = struct{}{}
+		newRules = append(newRules, subPerArg)
+	}
+	if !changed {
+		return rule, false
+	}
+	return SyscallRule(T(newRules)), true
+}
+
+// splitMatchers replaces every `splittableValueMatcher` with a
+// `splitMatcher` value matcher instead.
+// This enables optimizations that are split-aware to run without
+// the need to have logic handling this conversion.
+func splitMatchers(rule SyscallRule) (SyscallRule, bool) {
+	perArg, isPerArg := rule.(PerArg)
+	if !isPerArg {
+		return rule, false
+	}
+	changed := false
+	for argNum, valueMatcher := range perArg {
+		if _, isAlreadySplit := valueMatcher.(splitMatcher); isAlreadySplit {
+			continue
+		}
+		splittableMatcher, isSplittableMatcher := valueMatcher.(splittableValueMatcher)
+		if !isSplittableMatcher {
+			continue
+		}
+		perArg[argNum] = splittableMatcher.split()
+		changed = true
+	}
+	return perArg, changed
+}
+
+// simplifyHalfValueMatcher may convert a `halfValueMatcher` to a simpler
+// (and potentially faster) representation.
+func simplifyHalfValueMatcher(hvm halfValueMatcher) halfValueMatcher {
+	switch v := hvm.(type) {
+	case halfNotSet:
+		if v == 0 {
+			return halfAnyValue{}
+		}
+	case halfMaskedEqual:
+		if v.mask == 0 && v.value == 0 {
+			return halfAnyValue{}
+		}
+		if v.mask == 0xffffffff {
+			return halfEqualTo(v.value)
+		}
+	}
+	return hvm
+}
+
+// simplifyHalfValueMatchers replace `halfValueMatcher`s with their simplified
+// version.
+func simplifyHalfValueMatchers(rule SyscallRule) (SyscallRule, bool) {
+	perArg, isPerArg := rule.(PerArg)
+	if !isPerArg {
+		return rule, false
+	}
+	changed := false
+	for i, valueMatcher := range perArg {
+		sm, isSplitMatcher := valueMatcher.(splitMatcher)
+		if !isSplitMatcher {
+			continue
+		}
+		if newHigh := simplifyHalfValueMatcher(sm.highMatcher); newHigh.Repr() != sm.highMatcher.Repr() {
+			sm.highMatcher = newHigh
+			perArg[i] = sm
+			changed = true
+		}
+		if newLow := simplifyHalfValueMatcher(sm.lowMatcher); newLow.Repr() != sm.lowMatcher.Repr() {
+			sm.lowMatcher = newLow
+			perArg[i] = sm
+			changed = true
+		}
+	}
+	return perArg, changed
+}
+
+// anySplitMatchersToAnyValue converts `splitMatcher`s where both halves
+// match any value to a single AnyValue{} rule.
+func anySplitMatchersToAnyValue(rule SyscallRule) (SyscallRule, bool) {
+	perArg, isPerArg := rule.(PerArg)
+	if !isPerArg {
+		return rule, false
+	}
+	changed := false
+	for argNum, valueMatcher := range perArg {
+		sm, isSplitMatcher := valueMatcher.(splitMatcher)
+		if !isSplitMatcher {
+			continue
+		}
+		_, highIsAny := sm.highMatcher.(halfAnyValue)
+		_, lowIsAny := sm.lowMatcher.(halfAnyValue)
+		if highIsAny && lowIsAny {
+			perArg[argNum] = AnyValue{}
+			changed = true
+		}
+	}
+	return perArg, changed
+}
+
+// invalidValueMatcher is a stand-in `ValueMatcher` with a unique
+// representation that doesn't look like any legitimate `ValueMatcher`.
+// Calling any method other than `Repr` will fail.
+type invalidValueMatcher struct {
+	ValueMatcher
+}
+
+// Repr implements `ValueMatcher.Repr`.
+func (m invalidValueMatcher) Repr() string {
+	return "invalidValueMatcher"
+}
+
+// extractRepeatedMatchers looks for common argument matchers that are
+// repeated across all combinations of *other* argument matchers in branches
+// of an `Or` rule that contains only `PerArg` rules.
+// It removes them from these `PerArg` rules, creates an `Or` of the
+// matchers that are repeated across all combinations, and `And`s that
+// rule to the rewritten `Or` rule.
+// In other words (simplifying `PerArg` to 4 items for simplicity):
+//
+//	Or{
+//		PerArg{A1, B1, C1, D},
+//		PerArg{A2, B1, C1, D},
+//		PerArg{A1, B2, C2, D},
+//		PerArg{A2, B2, C2, D},
+//		PerArg{A1, B3, C3, D},
+//		PerArg{A2, B3, C3, D},
+//	}
+//
+// becomes (after one pass):
+//
+//	And{
+//		Or{
+//			# Note: These will get deduplicated by deduplicatePerArgs
+//			PerArg{A1, AnyValue{}, AnyValue{}, AnyValue{}},
+//			PerArg{A2, AnyValue{}, AnyValue{}, AnyValue{}},
+//			PerArg{A1, AnyValue{}, AnyValue{}, AnyValue{}},
+//			PerArg{A2, AnyValue{}, AnyValue{}, AnyValue{}},
+//			PerArg{A1, AnyValue{}, AnyValue{}, AnyValue{}},
+//			PerArg{A2, AnyValue{}, AnyValue{}, AnyValue{}},
+//		},
+//		Or{
+//			# Note: These will also get deduplicated by deduplicatePerArgs
+//			PerArg{AnyValue{}, B1, C1, D},
+//			PerArg{AnyValue{}, B1, C1, D},
+//			PerArg{AnyValue{}, B2, C2, D},
+//			PerArg{AnyValue{}, B2, C2, D},
+//			PerArg{AnyValue{}, B3, C3, D},
+//			PerArg{AnyValue{}, B3, C3, D},
+//		},
+//	}
+//
+// ... then, on the second pass (after deduplication),
+// the second inner `Or` rule gets recursively optimized to:
+//
+//	And{
+//		Or{
+//			PerArg{A1, AnyValue{}, AnyValue{}, AnyValue{}},
+//			PerArg{A2, AnyValue{}, AnyValue{}, AnyValue{}},
+//		},
+//		And{
+//			Or{
+//				PerArg{AnyValue{}, AnyValue{}, AnyValue{}, D},
+//				PerArg{AnyValue{}, AnyValue{}, AnyValue{}, D},
+//				PerArg{AnyValue{}, AnyValue{}, AnyValue{}, D},
+//			},
+//			Or{
+//				PerArg{AnyValue{}, B1, C1, AnyValue{}},
+//				PerArg{AnyValue{}, B2, C2, AnyValue{}},
+//				PerArg{AnyValue{}, B3, C3, AnyValue{}},
+//			},
+//		},
+//	}
+//
+// ... which (after other optimizers clean this all up), finally becomes:
+//
+//	And{
+//		Or{
+//			PerArg{A1, AnyValue{}, AnyValue{}, AnyValue{}},
+//			PerArg{A2, AnyValue{}, AnyValue{}, AnyValue{}},
+//		},
+//		PerArg{AnyValue{}, AnyValue{}, AnyValue{}, D},
+//		Or{
+//			PerArg{AnyValue{}, B1, C1, AnyValue{}},
+//			PerArg{AnyValue{}, B2, C2, AnyValue{}},
+//			PerArg{AnyValue{}, B3, C3, AnyValue{}},
+//		},
+//	}
+//
+// ... Turning 24 comparisons into just 9.
+func extractRepeatedMatchers(rule SyscallRule) (SyscallRule, bool) {
+	orRule, isOr := rule.(Or)
+	if !isOr || len(orRule) < 2 {
+		return rule, false
+	}
+	for _, subRule := range orRule {
+		if _, subIsPerArg := subRule.(PerArg); !subIsPerArg {
+			return rule, false
+		}
+	}
+
+	// sameStringSet returns whether the given string sets are equal.
+	sameStringSet := func(m1, m2 map[string]struct{}) bool {
+		if len(m1) != len(m2) {
+			return false
+		}
+		for k := range m1 {
+			if _, found := m2[k]; !found {
+				return false
+			}
+		}
+		return true
+	}
+
+	for argNum := 0; argNum < len(orRule[0].(PerArg)); argNum++ {
+		// Check if `argNum` takes on a set of matchers common for all
+		// combinations of all other matchers.
+		allOtherMatchersSigs := make(map[string]struct{}, len(orRule))
+		argExprToOtherMatchersSigs := make(map[string]map[string]struct{}, len(orRule))
+		allArgNumMatchersAreAnyValue := true
+		allOtherMatchersAreAnyValue := true
+		for _, subRule := range orRule {
+			perArg := subRule.(PerArg)
+			for i, valueMatcher := range perArg {
+				_, isAnyValue := valueMatcher.(AnyValue)
+				if i == argNum {
+					allArgNumMatchersAreAnyValue = allArgNumMatchersAreAnyValue && isAnyValue
+				} else {
+					allOtherMatchersAreAnyValue = allOtherMatchersAreAnyValue && isAnyValue
+				}
+			}
+			repr := perArg[argNum].Repr()
+			otherMatchers := perArg.clone()
+			otherMatchers[argNum] = invalidValueMatcher{}
+			otherMatchersSig := otherMatchers.signature()
+			allOtherMatchersSigs[otherMatchersSig] = struct{}{}
+			if _, reprSeen := argExprToOtherMatchersSigs[repr]; !reprSeen {
+				argExprToOtherMatchersSigs[repr] = make(map[string]struct{}, len(orRule))
+			}
+			argExprToOtherMatchersSigs[repr][otherMatchersSig] = struct{}{}
+		}
+		if allArgNumMatchersAreAnyValue || allOtherMatchersAreAnyValue {
+			// Cannot optimize.
+			continue
+		}
+		// Now check if each possible repr of `argNum` got the same set of
+		// signatures for other matchers as `allOtherMatchersSigs`.
+		sameOtherMatchers := true
+		for _, omsigs := range argExprToOtherMatchersSigs {
+			if !sameStringSet(omsigs, allOtherMatchersSigs) {
+				sameOtherMatchers = false
+				break
+			}
+		}
+		if !sameOtherMatchers {
+			continue
+		}
+		// We can simplify the rule by extracting `argNum` out.
+		// Create two copies of `orRule`: One with only `argNum`,
+		// and the other one with all arguments except `argNum`.
+		// This will likely contain many duplicates but that's OK,
+		// they'll be optimized out by `deduplicatePerArgs`.
+		argNumMatch := Or(make([]SyscallRule, len(orRule)))
+		otherArgsMatch := Or(make([]SyscallRule, len(orRule)))
+		for i, subRule := range orRule {
+			perArg := subRule.(PerArg)
+			onlyArg := PerArg{AnyValue{}, AnyValue{}, AnyValue{}, AnyValue{}, AnyValue{}, AnyValue{}, AnyValue{}}
+			onlyArg[argNum] = perArg[argNum]
+			allExceptArg := perArg.clone()
+			allExceptArg[argNum] = AnyValue{}
+			argNumMatch[i] = onlyArg
+			otherArgsMatch[i] = allExceptArg
+		}
+		// Do not attempt to see if other arguments are also eligible for the
+		// same optimization, as this would complicate the logic of this
+		// already-complicated function further, and will be caught in future
+		// iterations of the optimizer anyway.
+		// Additionally, `argNumMatch` and `otherArgsMatch` may well be
+		// single-item, so the other (simpler) optimizers should run on them
+		// first.
+		return And{argNumMatch, otherArgsMatch}, true
+	}
+	return rule, false
+}
+
 // optimizeSyscallRuleFuncs losslessly optimizes a SyscallRule using the given
 // optimization functions.
 // Optimizers should be ranked in order of importance, with the most
@@ -135,5 +498,37 @@ func optimizeSyscallRule(rule SyscallRule) SyscallRule {
 		// linearly scanning through the first (and only) level of rules.
 		convertMatchAllOrXToMatchAll,
 		convertMatchAllAndXToX,
+
+		// Replace all `nil` values in `PerArg` to `AnyValue`, to simplify
+		// the `PerArg` matchers below.
+		nilInPerArgToAnyValue,
+
+		// Deduplicate redundant `PerArg`s in Or and And.
+		// This must come after `nilInPerArgToAnyValue` because it does not
+		// handle the nil case.
+		deduplicatePerArgs[Or],
+		deduplicatePerArgs[And],
+
+		// Remove useless `PerArg` matchers.
+		// This must come after `nilInPerArgToAnyValue` because it does not
+		// handle the nil case.
+		convertUselessPerArgToMatchAll,
+
+		// Replace `ValueMatcher`s that are splittable into their split version.
+		splitMatchers,
+
+		// Replace `halfValueMatcher`s with their simplified version.
+		simplifyHalfValueMatchers,
+
+		// Replace `splitMatchers` that match any value with `AnyValue`.
+		anySplitMatchersToAnyValue,
+
+		// Extract repeated argument matchers out of `Or` expressions.
+		// This must come after `nilInPerArgToAnyValue` because it does not
+		// handle the nil case.
+		// This should ideally run late in the list because it does a bunch
+		// of memory allocations (even in the non-optimizable case), which
+		// should be avoided unless there is nothing else left to optimize.
+		extractRepeatedMatchers,
 	})
 }

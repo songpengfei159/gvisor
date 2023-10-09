@@ -622,6 +622,19 @@ type PerArg [7]ValueMatcher // 6 arguments + RIP
 // instruction pointer.
 const RuleIP = 6
 
+// clone returns a copy of this `PerArg`.
+func (pa PerArg) clone() PerArg {
+	return PerArg{
+		pa[0],
+		pa[1],
+		pa[2],
+		pa[3],
+		pa[4],
+		pa[5],
+		pa[6],
+	}
+}
+
 // Render implements `SyscallRule.Render`.
 func (pa PerArg) Render(program *syscallProgram, labelSet *labelSet) {
 	for i, arg := range pa {
