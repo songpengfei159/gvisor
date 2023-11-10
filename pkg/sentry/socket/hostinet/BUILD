@@ -1,0 +1,50 @@
+load("//tools:defs.bzl", "go_library")
+
+package(
+    default_applicable_licenses = ["//:license"],
+    licenses = ["notice"],
+)
+
+go_library(
+    name = "hostinet",
+    srcs = [
+        "hostinet.go",
+        "netlink.go",
+        "socket.go",
+        "socket_unsafe.go",
+        "sockopt.go",
+        "sockopt_impl.go",
+        "stack.go",
+        "stack_unsafe.go",
+    ],
+    visibility = ["//pkg/sentry:internal"],
+    deps = [
+        "//pkg/abi/linux",
+        "//pkg/atomicbitops",
+        "//pkg/binary",
+        "//pkg/context",
+        "//pkg/errors/linuxerr",
+        "//pkg/fdnotifier",
+        "//pkg/hostarch",
+        "//pkg/log",
+        "//pkg/marshal",
+        "//pkg/marshal/primitive",
+        "//pkg/safemem",
+        "//pkg/sentry/arch",
+        "//pkg/sentry/fsimpl/sockfs",
+        "//pkg/sentry/hostfd",
+        "//pkg/sentry/inet",
+        "//pkg/sentry/kernel",
+        "//pkg/sentry/kernel/auth",
+        "//pkg/sentry/kernel/time",
+        "//pkg/sentry/socket",
+        "//pkg/sentry/socket/control",
+        "//pkg/sentry/vfs",
+        "//pkg/syserr",
+        "//pkg/tcpip",
+        "//pkg/tcpip/stack",
+        "//pkg/usermem",
+        "//pkg/waiter",
+        "@org_golang_x_sys//unix:go_default_library",
+    ],
+)
