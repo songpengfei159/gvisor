@@ -2187,6 +2187,10 @@ TEST(MountTest, MountNamespaceSlavesNewUserNamespace) {
     TEST_CHECK(mount("test2", "test", kTmpfs, 0, NULL) == 0);
     TEST_CHECK(mknod(JoinPath("test", "boo").c_str(), 0777 | S_IFREG, 0) == 0);
 
+    TEST_CHECK(umount2("test", MNT_DETACH) == 0);
+    // This should fail because the mount is locked.
+    TEST_CHECK_ERRNO(umount2("test", MNT_DETACH), EINVAL);
+
     // Check that there is a master entry in mountinfo.
     fd = open("/proc/self/mountinfo", O_RDONLY);
     TEST_CHECK(fd >= 0);
