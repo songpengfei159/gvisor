@@ -678,18 +678,18 @@ func (l *Loader) installSeccompFilters() error {
 		l.PreSeccompCallback()
 	}
 	if l.root.conf.DisableSeccomp {
-		filter.Report("syscall filter is DISABLED. Running in less secure mode.")
+		log.Warningf("*** SECCOMP WARNING: syscall filter is DISABLED. Running in less secure mode.")
 	} else {
 		hostnet := l.root.conf.Network == config.NetworkHost
 		opts := filter.Options{
-			Platform:              l.k.Platform,
+			Platform:              l.k.Platform.SeccompInfo(),
 			HostNetwork:           hostnet,
 			HostNetworkRawSockets: hostnet && l.root.conf.EnableRaw,
 			HostFilesystem:        l.root.conf.DirectFS,
 			ProfileEnable:         l.root.conf.ProfileEnable,
 			NVProxy:               specutils.NVProxyEnabled(l.root.spec, l.root.conf),
 			TPUProxy:              specutils.TPUProxyIsEnabled(l.root.spec, l.root.conf),
-			ControllerFD:          l.ctrl.srv.FD(),
+			ControllerFD:          uint32(l.ctrl.srv.FD()),
 		}
 		if err := filter.Install(opts); err != nil {
 			return fmt.Errorf("installing seccomp filters: %w", err)

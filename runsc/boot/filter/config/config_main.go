@@ -12,11 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package filter
+package config
 
 import (
-	"os"
-
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/seccomp"
@@ -67,31 +65,15 @@ var allowedSyscalls = seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
 	unix.SYS_FSTAT:     seccomp.MatchAll{},
 	unix.SYS_FSYNC:     seccomp.MatchAll{},
 	unix.SYS_FTRUNCATE: seccomp.MatchAll{},
-	unix.SYS_FUTEX: seccomp.Or{
-		seccomp.PerArg{
-			seccomp.AnyValue{},
-			seccomp.EqualTo(linux.FUTEX_WAIT | linux.FUTEX_PRIVATE_FLAG),
-			seccomp.AnyValue{},
-			seccomp.AnyValue{},
-		},
-		seccomp.PerArg{
-			seccomp.AnyValue{},
-			seccomp.EqualTo(linux.FUTEX_WAKE | linux.FUTEX_PRIVATE_FLAG),
-			seccomp.AnyValue{},
-		},
-		// Non-private variants are included for flipcall support. They are otherwise
-		// unnecessary, as the sentry will use only private futexes internally.
-		seccomp.PerArg{
-			seccomp.AnyValue{},
-			seccomp.EqualTo(linux.FUTEX_WAIT),
-			seccomp.AnyValue{},
-			seccomp.AnyValue{},
-		},
-		seccomp.PerArg{
-			seccomp.AnyValue{},
-			seccomp.EqualTo(linux.FUTEX_WAKE),
-			seccomp.AnyValue{},
-		},
+	unix.SYS_FUTEX: seccomp.PerArg{
+		seccomp.AnyValue{},
+		// Allow any combination of FUTEX_{WAIT,WAKE,PRIVATE_FLAG}, but no other.
+		// Non-private variants are included for flipcall support. They are
+		// otherwise unnecessary, as the sentry will use only private futexes
+		// internally.
+		seccomp.BitsAllowlist(
+			linux.FUTEX_WAIT | linux.FUTEX_WAKE | linux.FUTEX_PRIVATE_FLAG,
+		),
 	},
 	// getcpu is used by some versions of the Go runtime and by the hostcpu
 	// package on arm64.
@@ -299,9 +281,6 @@ var allowedSyscalls = seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
 		seccomp.AnyValue{}, /* new_value */
 		seccomp.EqualTo(0), /* old_value */
 	},
-	unix.SYS_TGKILL: seccomp.PerArg{
-		seccomp.EqualTo(uint64(os.Getpid())),
-	},
 	unix.SYS_UTIMENSAT: seccomp.PerArg{
 		seccomp.AnyValue{},
 		seccomp.EqualTo(0), /* null pathname */
@@ -317,7 +296,7 @@ var allowedSyscalls = seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
 	},
 })
 
-func controlServerFilters(fd int) seccomp.SyscallRules {
+func controlServerFilters(fd uint32) seccomp.SyscallRules {
 	return seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
 		unix.SYS_ACCEPT4: seccomp.PerArg{
 			seccomp.EqualTo(fd),
@@ -330,6 +309,15 @@ func controlServerFilters(fd int) seccomp.SyscallRules {
 			seccomp.AnyValue{},
 			seccomp.EqualTo(unix.SOL_SOCKET),
 			seccomp.EqualTo(unix.SO_PEERCRED),
+		},
+	})
+}
+
+// selfPIDFilters contains syscall filters that depend on the process's PID.
+func selfPIDFilters(pid uint64) seccomp.SyscallRules {
+	return seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
+		unix.SYS_TGKILL: seccomp.PerArg{
+			seccomp.EqualTo(pid),
 		},
 	})
 }

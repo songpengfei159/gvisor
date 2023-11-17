@@ -1225,6 +1225,34 @@ func TestOptimizeSyscallRule(t *testing.T) {
 	// av is a shorthand for `AnyValue{}`, used below to keep `PerArg`
 	// structs short enough to comfortably fit on one line.
 	av := AnyValue{}
+
+	// Some useful constants that are larger than uint32.
+	const (
+		a1 = 0xA1A1A1A1A1A1A1A1
+		a2 = 0xA2A2A2A2A2A2A2A2
+		b1 = 0xB1B1B1B1B1B1B1B1
+		b2 = 0xB2B2B2B2B2B2B2B2
+		b3 = 0xB3B3B3B3B3B3B3B3
+		c1 = 0xC1C1C1C1C1C1C1C1
+		c2 = 0xC2C2C2C2C2C2C2C2
+		c3 = 0xC3C3C3C3C3C3C3C3
+		d0 = 0xD0D0D0D0D0D0D0D0
+		d1 = 0xD1D1D1D1D1D1D1D1
+	)
+
+	// split replaces a `splittableValueMatcher` rule with its `splitMatcher`
+	// version.
+	s := func(matcher splittableValueMatcher) ValueMatcher {
+		return matcher.split()
+	}
+
+	highEq := func(val uintptr) splitMatcher {
+		return high32BitsMatch(halfEqualTo(val))
+	}
+	lowEq := func(val uintptr) splitMatcher {
+		return low32BitsMatch(halfEqualTo(val))
+	}
+
 	for _, test := range []struct {
 		name       string
 		rule       SyscallRule
@@ -1240,25 +1268,25 @@ func TestOptimizeSyscallRule(t *testing.T) {
 			name: "flatten Or rule",
 			rule: Or{
 				Or{
-					PerArg{EqualTo(0x11)},
+					PerArg{EqualTo(a1)},
 					Or{
-						PerArg{EqualTo(0x22)},
-						PerArg{EqualTo(0x33)},
+						PerArg{EqualTo(b1)},
+						PerArg{EqualTo(b2)},
 					},
-					PerArg{EqualTo(0x44)},
+					PerArg{EqualTo(c1)},
 				},
 				Or{
-					PerArg{EqualTo(0x55)},
-					PerArg{EqualTo(0x66)},
+					PerArg{EqualTo(d0)},
+					PerArg{EqualTo(d1)},
 				},
 			},
 			want: Or{
-				PerArg{EqualTo(0x11), av, av, av, av, av, av},
-				PerArg{EqualTo(0x22), av, av, av, av, av, av},
-				PerArg{EqualTo(0x33), av, av, av, av, av, av},
-				PerArg{EqualTo(0x44), av, av, av, av, av, av},
-				PerArg{EqualTo(0x55), av, av, av, av, av, av},
-				PerArg{EqualTo(0x66), av, av, av, av, av, av},
+				PerArg{s(EqualTo(a1)), av, av, av, av, av, av},
+				PerArg{s(EqualTo(b1)), av, av, av, av, av, av},
+				PerArg{s(EqualTo(b2)), av, av, av, av, av, av},
+				PerArg{s(EqualTo(c1)), av, av, av, av, av, av},
+				PerArg{s(EqualTo(d0)), av, av, av, av, av, av},
+				PerArg{s(EqualTo(d1)), av, av, av, av, av, av},
 			},
 		},
 		{
@@ -1291,14 +1319,14 @@ func TestOptimizeSyscallRule(t *testing.T) {
 			rule: Or{
 				PerArg{EqualTo(0x11)},
 			},
-			want: PerArg{EqualTo(0x11), av, av, av, av, av, av},
+			want: PerArg{s(EqualTo(0x11)), av, av, av, av, av, av},
 		},
 		{
 			name: "simplify And with single rule",
 			rule: And{
 				PerArg{EqualTo(0x11)},
 			},
-			want: PerArg{EqualTo(0x11), av, av, av, av, av, av},
+			want: PerArg{s(EqualTo(0x11)), av, av, av, av, av, av},
 		},
 		{
 			name: "simplify Or with MatchAll",
@@ -1363,6 +1391,127 @@ func TestOptimizeSyscallRule(t *testing.T) {
 				convertUselessPerArgToMatchAll,
 			},
 			want: MatchAll{},
+		},
+		{
+			name: "halfValueMatchers are simplified",
+			rule: PerArg{
+				EqualTo(0),
+				splitMatcher{
+					highMatcher: halfNotSet(0),
+					lowMatcher: halfMaskedEqual{
+						mask:  0,
+						value: 0x89abcdef,
+					},
+				},
+				splitMatcher{
+					highMatcher: halfNotSet(1 << 4),
+					lowMatcher: halfMaskedEqual{
+						mask:  0xffffffff,
+						value: 0x89abcdef,
+					},
+				},
+				splitMatcher{
+					highMatcher: halfNotSet(0),
+					lowMatcher: halfMaskedEqual{
+						mask:  0xffffffff,
+						value: 0x89abcdef,
+					},
+				},
+				splitMatcher{
+					highMatcher: halfNotSet(0),
+					lowMatcher: halfMaskedEqual{
+						mask:  0,
+						value: 0,
+					},
+				},
+				splitMatcher{
+					highMatcher: halfAnyValue{},
+					lowMatcher: halfMaskedEqual{
+						mask:  0x89abcdef,
+						value: 0x89abcdef,
+					},
+				},
+				BitsAllowlist(0xabcdef),
+			},
+			want: PerArg{
+				s(EqualTo(0)),
+				splitMatcher{
+					highMatcher: halfAnyValue{},
+					lowMatcher: halfMaskedEqual{
+						mask:  0,
+						value: 0x89abcdef,
+					},
+				},
+				splitMatcher{
+					highMatcher: halfNotSet(1 << 4),
+					lowMatcher:  halfEqualTo(0x89abcdef),
+				},
+				splitMatcher{
+					highMatcher: halfAnyValue{},
+					lowMatcher:  halfEqualTo(0x89abcdef),
+				},
+				av, // Both halves are simplified to `halfAnyValue`.
+				splitMatcher{
+					highMatcher: halfAnyValue{},
+					lowMatcher: halfMaskedEqual{
+						mask:  0x89abcdef,
+						value: 0x89abcdef,
+					},
+				},
+				splitMatcher{
+					// High half gets simplified to equaling zero.
+					highMatcher: halfEqualTo(0),
+					// Low half gets simplified to a bit-not-set check.
+					lowMatcher: halfNotSet(^uint32(0xabcdef)),
+					// Keep user-friendly representation.
+					repr: fmt.Sprintf("& %#x == %#x", ^uint64(0xabcdef), 0),
+				},
+			},
+		},
+		{
+			name: "Common value matchers in PerArg are extracted",
+			rule: Or{
+				PerArg{EqualTo(a1), EqualTo(b1), EqualTo(c1), EqualTo(d0)},
+				PerArg{EqualTo(a2), EqualTo(b1), EqualTo(c1), EqualTo(d0)},
+				PerArg{EqualTo(a1), EqualTo(b2), EqualTo(c2), EqualTo(d0)},
+				PerArg{EqualTo(a2), EqualTo(b2), EqualTo(c2), EqualTo(d0)},
+				PerArg{EqualTo(a1), EqualTo(b3), EqualTo(c3), EqualTo(d0)},
+				PerArg{EqualTo(a2), EqualTo(b3), EqualTo(c3), EqualTo(d0)},
+			},
+			want: And{
+				Or{
+					PerArg{s(EqualTo(a1)), av, av, av, av, av, av},
+					PerArg{s(EqualTo(a2)), av, av, av, av, av, av},
+				},
+				PerArg{av, av, av, s(EqualTo(d0)), av, av, av},
+				Or{
+					PerArg{av, s(EqualTo(b1)), s(EqualTo(c1)), av, av, av, av},
+					PerArg{av, s(EqualTo(b2)), s(EqualTo(c2)), av, av, av, av},
+					PerArg{av, s(EqualTo(b3)), s(EqualTo(c3)), av, av, av, av},
+				},
+			},
+		},
+		{
+			name: "Common halfValueMatchers in splitMatchers are extracted",
+			rule: Or{
+				PerArg{EqualTo(0xA1), EqualTo(0xB1), EqualTo(c1), EqualTo(d0)},
+				PerArg{EqualTo(0xA1), EqualTo(0xB1), EqualTo(c2), EqualTo(d0)},
+				PerArg{EqualTo(0xA2), EqualTo(0xB2), EqualTo(c1), EqualTo(d0)},
+				PerArg{EqualTo(0xA2), EqualTo(0xB2), EqualTo(c2), EqualTo(d0)},
+			},
+			want: And{
+				PerArg{highEq(0), av, av, av, av, av, av},
+				PerArg{av, highEq(0), av, av, av, av, av},
+				Or{
+					PerArg{av, av, s(EqualTo(c1)), av, av, av, av},
+					PerArg{av, av, s(EqualTo(c2)), av, av, av, av},
+				},
+				PerArg{av, av, av, s(EqualTo(d0)), av, av, av},
+				Or{
+					PerArg{lowEq(0xA1), lowEq(0xB1), av, av, av, av, av},
+					PerArg{lowEq(0xA2), lowEq(0xB2), av, av, av, av, av},
+				},
+			},
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
