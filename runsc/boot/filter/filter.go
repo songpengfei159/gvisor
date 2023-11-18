@@ -17,6 +17,8 @@
 package filter
 
 import (
+	"fmt"
+
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/seccomp"
 	"gvisor.dev/gvisor/runsc/boot/filter/config"
@@ -27,11 +29,19 @@ type Options = config.Options
 
 // Install seccomp filters based on the given platform.
 func Install(opt Options) error {
-	// TODO(b/298726675): Look up precompiled rules and use them here if
-	// possible.
-	rules, denyRules := config.Rules(opt)
 	for _, warning := range config.Warnings(opt) {
 		log.Warningf("*** SECCOMP WARNING: %s", warning)
 	}
+	precompiled, found := GetPrecompiled(opt.ConfigKey())
+	if found {
+		log.Debugf("Loaded precompiled seccomp instructions for options %v, using variables: %v", opt.ConfigKey(), opt.Vars())
+		insns, err := precompiled.RenderInstructions(opt.Vars())
+		if err != nil {
+			return fmt.Errorf("cannot render precompiled program for options %v: %w", opt, err)
+		}
+		return seccomp.SetFilter(insns)
+	}
+	log.Infof("No precompiled program found for config options %v, building seccomp program from scratch. This may slow down container startup.", opt)
+	rules, denyRules := config.Rules(opt)
 	return seccomp.Install(rules, denyRules, config.SeccompOptions(opt))
 }
