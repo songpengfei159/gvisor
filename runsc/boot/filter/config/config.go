@@ -24,6 +24,7 @@ import (
 	"gvisor.dev/gvisor/pkg/seccomp"
 	"gvisor.dev/gvisor/pkg/sentry/devices/accel"
 	"gvisor.dev/gvisor/pkg/sentry/devices/nvproxy"
+	"gvisor.dev/gvisor/pkg/sentry/devices/tpuproxy"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
 )
 
@@ -106,6 +107,7 @@ func Rules(opt Options) (seccomp.SyscallRules, seccomp.SyscallRules) {
 	}
 	if opt.TPUProxy {
 		s.Merge(accel.Filters())
+		s.Merge(tpuproxy.Filters())
 	}
 
 	s.Merge(opt.Platform.SyscallFilters(opt.Platform.Variables()))

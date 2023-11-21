@@ -30,6 +30,7 @@ go_library(
         "//pkg/seccomp",
         "//pkg/sentry/devices/accel",
         "//pkg/sentry/devices/nvproxy",
+        "//pkg/sentry/devices/tpuproxy",
         "//pkg/sentry/platform",
         "//pkg/sentry/socket/hostinet",
         "//pkg/tcpip/link/fdbased",
