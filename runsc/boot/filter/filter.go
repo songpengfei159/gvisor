@@ -17,21 +17,45 @@
 package filter
 
 import (
+	"fmt"
+
+	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/seccomp"
 	"gvisor.dev/gvisor/runsc/boot/filter/config"
 )
+
+// ***   DEBUG TIP   ***
+// If you suspect the Sentry is getting killed due to a seccomp violation,
+// change this to `true` to get a panic stack trace when there is a
+// violation.
+const debugFilter = false
 
 // Options is a re-export of the config Options type under this package.
 type Options = config.Options
 
 // Install seccomp filters based on the given platform.
 func Install(opt Options) error {
-	// TODO(b/298726675): Look up precompiled rules and use them here if
-	// possible.
-	rules, denyRules := config.Rules(opt)
 	for _, warning := range config.Warnings(opt) {
 		log.Warningf("*** SECCOMP WARNING: %s", warning)
 	}
-	return seccomp.Install(rules, denyRules, config.SeccompOptions(opt))
+	key := opt.ConfigKey()
+	precompiled, usePrecompiled := GetPrecompiled(key)
+	if usePrecompiled && !debugFilter {
+		vars := opt.Vars()
+		log.Debugf("Loaded precompiled seccomp instructions for options %v, using variables: %v", key, vars)
+		insns, err := precompiled.RenderInstructions(vars)
+		if err != nil {
+			return fmt.Errorf("cannot render precompiled program for options %v / vars %v: %w", key, vars, err)
+		}
+		return seccomp.SetFilter(insns)
+	}
+	seccompOpts := config.SeccompOptions(opt)
+	if debugFilter {
+		seccompOpts.DefaultAction = linux.SECCOMP_RET_TRAP
+	} else {
+		log.Infof("No precompiled program found for config options %v, building seccomp program from scratch. This may slow down container startup.", key)
+	}
+	rules, denyRules := config.Rules(opt)
+	return seccomp.Install(rules, denyRules, seccompOpts)
 }
