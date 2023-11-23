@@ -21,7 +21,6 @@ import (
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/atomicbitops"
-	"gvisor.dev/gvisor/pkg/bpf"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/metric"
@@ -451,12 +450,12 @@ type Task struct {
 	// parentDeathSignal is protected by mu.
 	parentDeathSignal linux.Signal
 
-	// syscallFilters is all seccomp-bpf syscall filters applicable to the
-	// task, in the order in which they were installed. The type of the atomic
-	// is []bpf.Program. Writing needs to be protected by the signal mutex.
+	// seccomp contains all seccomp-bpf syscall filters applicable to the task.
+	// The type of the atomic is *taskSeccompFilters.
+	// Writing needs to be protected by the signal mutex.
 	//
-	// syscallFilters is owned by the task goroutine.
-	syscallFilters atomic.Value `state:".([]bpf.Program)"`
+	// seccomp is owned by the task goroutine.
+	seccomp atomic.Value `state:".(*taskSeccomp)"`
 
 	// If cleartid is non-zero, treat it as a pointer to a ThreadID in the
 	// task's virtual address space; when the task exits, set the pointed-to
@@ -622,15 +621,16 @@ func (t *Task) loadPtraceTracer(tracer *Task) {
 	t.ptraceTracer.Store(tracer)
 }
 
-func (t *Task) saveSyscallFilters() []bpf.Program {
-	if f := t.syscallFilters.Load(); f != nil {
-		return f.([]bpf.Program)
+func (t *Task) saveSeccomp() *taskSeccomp {
+	if f := t.seccomp.Load(); f != nil {
+		return f.(*taskSeccomp)
 	}
 	return nil
 }
 
-func (t *Task) loadSyscallFilters(filters []bpf.Program) {
-	t.syscallFilters.Store(filters)
+func (t *Task) loadSeccomp(seccompData *taskSeccomp) {
+	seccompData.populateCache(t)
+	t.seccomp.Store(seccompData)
 }
 
 // afterLoad is invoked by stateify.

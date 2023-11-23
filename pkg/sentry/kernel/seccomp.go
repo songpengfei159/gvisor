@@ -15,15 +15,48 @@
 package kernel
 
 import (
+	"reflect"
+
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/abi/sentry"
 	"gvisor.dev/gvisor/pkg/bpf"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 )
 
-const maxSyscallFilterInstructions = 1 << 15
+const (
+	maxSyscallFilterInstructions = 1 << 15
+
+	// uncacheableBPFAction is an invalid seccomp action code.
+	// It is used as a sentinel value in `taskSeccompFilters.cache` to indicate
+	// that a specific syscall number is uncachable.
+	uncacheableBPFAction = linux.SECCOMP_RET_ACTION_FULL
+)
+
+// taskSeccomp holds seccomp-related data for a `Task`.
+type taskSeccomp struct {
+	// filters is the list of seccomp programs that are applied to the task,
+	// in the order in which they were installed.
+	filters []bpf.Program
+
+	// cache maps syscall numbers to the action to take for that syscall number.
+	// It is only populated for syscalls where determining this action does not
+	// involve any input data other than the architecture and the syscall
+	// number in any of `filters`.
+	// If any other input is necessary, the cache stores `uncacheableBPFAction`
+	// to indicate that this syscall number's rules are not cacheable.
+	cache [sentry.MaxSyscallNum + 1]linux.BPFAction
+}
+
+// copy returns a copy of this `taskSeccomp`.
+func (ts *taskSeccomp) copy() *taskSeccomp {
+	return &taskSeccomp{
+		filters: append(([]bpf.Program)(nil), ts.filters...),
+		cache:   ts.cache,
+	}
+}
 
 // dataAsBPFInput returns a serialized BPF program, only valid on the current task
 // goroutine.
@@ -99,6 +132,18 @@ func (t *Task) checkSeccompSyscall(sysno int32, args arch.SyscallArguments, ip h
 }
 
 func (t *Task) evaluateSyscallFilters(sysno int32, args arch.SyscallArguments, ip hostarch.Addr) uint32 {
+	ret := uint32(linux.SECCOMP_RET_ALLOW)
+	s := t.seccomp.Load()
+	if s == nil {
+		return ret
+	}
+	ts := s.(*taskSeccomp)
+	if sysno >= 0 && sysno <= sentry.MaxSyscallNum {
+		if cached := ts.cache[sysno]; cached != uncacheableBPFAction {
+			return uint32(cached)
+		}
+	}
+
 	data := linux.SeccompData{
 		Nr:                 sysno,
 		Arch:               t.image.st.AuditNumber,
@@ -114,16 +159,10 @@ func (t *Task) evaluateSyscallFilters(sysno int32, args arch.SyscallArguments, i
 	}
 	input := dataAsBPFInput(t, &data)
 
-	ret := uint32(linux.SECCOMP_RET_ALLOW)
-	f := t.syscallFilters.Load()
-	if f == nil {
-		return ret
-	}
-
 	// "Every filter successfully installed will be evaluated (in reverse
 	// order) for each system call the task makes." - kernel/seccomp.c
-	for i := len(f.([]bpf.Program)) - 1; i >= 0; i-- {
-		thisRet, err := bpf.Exec[bpf.NativeEndian](f.([]bpf.Program)[i], input)
+	for i := len(ts.filters) - 1; i >= 0; i-- {
+		thisRet, err := bpf.Exec[bpf.NativeEndian](ts.filters[i], input)
 		if err != nil {
 			t.Debugf("seccomp-bpf filter %d returned error: %v", i, err)
 			thisRet = uint32(linux.SECCOMP_RET_KILL_THREAD)
@@ -147,6 +186,62 @@ func (t *Task) evaluateSyscallFilters(sysno int32, args arch.SyscallArguments, i
 	return ret
 }
 
+// populateCache recomputes `ts.cache` from `ts.filters`.
+func (ts *taskSeccomp) populateCache(t *Task) {
+	// Look up Nr and Arch fields, we'll use their offsets later
+	// to verify whether they were accessed.
+	sd := linux.SeccompData{}
+	sdType := reflect.TypeOf(sd)
+	nrField, ok := sdType.FieldByName("Nr")
+	if !ok {
+		panic("linux.SeccompData.Nr field not found")
+	}
+	archField, ok := sdType.FieldByName("Arch")
+	if !ok {
+		panic("linux.SeccompData.Arch field not found")
+	}
+
+	for sysno := int32(0); sysno <= sentry.MaxSyscallNum; sysno++ {
+		sd.Nr = sysno
+		sd.Arch = t.image.st.AuditNumber
+		input := dataAsBPFInput(t, &sd)
+		isCacheable := true
+		ret := linux.BPFAction(linux.SECCOMP_RET_ALLOW)
+		// See notes in `evaluateSyscallFilters` for how to properly interpret
+		// seccomp filter and results. We use the same approach here: iterate
+		// through filters backwards, and take the smallest result.
+	nextFilter:
+		for i := len(ts.filters) - 1; i >= 0; i-- {
+			exec, err := bpf.InstrumentedExec[bpf.NativeEndian](ts.filters[i], input)
+			if err != nil {
+				isCacheable = false
+				break
+			}
+			for offset, accessed := range exec.InputAccessed {
+				if !accessed {
+					continue // Input byte not accessed by the program.
+				}
+				if uintptr(offset) >= nrField.Offset && uintptr(offset) < nrField.Offset+nrField.Type.Size() {
+					continue // The program accessed the "Nr" field, this is OK.
+				}
+				if uintptr(offset) >= archField.Offset && uintptr(offset) < archField.Offset+archField.Type.Size() {
+					continue // The program accessed the "Arch" field, this is OK.
+				}
+				isCacheable = false
+				break nextFilter
+			}
+			if (linux.BPFAction(exec.ReturnValue) & linux.SECCOMP_RET_ACTION) < (ret & linux.SECCOMP_RET_ACTION) {
+				ret = linux.BPFAction(exec.ReturnValue)
+			}
+		}
+		if isCacheable {
+			ts.cache[sysno] = ret
+		} else {
+			ts.cache[sysno] = uncacheableBPFAction
+		}
+	}
+}
+
 // AppendSyscallFilter adds BPF program p as a system call filter.
 //
 // Preconditions: The caller must be running on the task goroutine.
@@ -161,30 +256,29 @@ func (t *Task) AppendSyscallFilter(p bpf.Program, syncAll bool) error {
 	// instructions per filter beyond the first) to maxSyscallFilterInstructions.
 	// This restriction is inherited from Linux.
 	totalLength := p.Length()
-	var newFilters []bpf.Program
+	newSeccomp := &taskSeccomp{}
 
-	if sf := t.syscallFilters.Load(); sf != nil {
-		oldFilters := sf.([]bpf.Program)
-		for _, f := range oldFilters {
+	if s := t.seccomp.Load(); s != nil {
+		ts := s.(*taskSeccomp)
+		for _, f := range ts.filters {
 			totalLength += f.Length() + 4
 		}
-		newFilters = append(newFilters, oldFilters...)
+		newSeccomp.filters = append(newSeccomp.filters, ts.filters...)
 	}
 
 	if totalLength > maxSyscallFilterInstructions {
 		return linuxerr.ENOMEM
 	}
 
-	newFilters = append(newFilters, p)
-	t.syscallFilters.Store(newFilters)
+	newSeccomp.filters = append(newSeccomp.filters, p)
+	newSeccomp.populateCache(t)
+	t.seccomp.Store(newSeccomp)
 
 	if syncAll {
 		// Note: No new privs is always assumed to be set.
 		for ot := t.tg.tasks.Front(); ot != nil; ot = ot.Next() {
 			if ot != t {
-				var copiedFilters []bpf.Program
-				copiedFilters = append(copiedFilters, newFilters...)
-				ot.syscallFilters.Store(copiedFilters)
+				ot.seccomp.Store(newSeccomp.copy())
 			}
 		}
 	}
@@ -196,8 +290,8 @@ func (t *Task) AppendSyscallFilter(p bpf.Program, syncAll bool) error {
 // seccomp syscall filtering mode, appropriate for both prctl(PR_GET_SECCOMP)
 // and /proc/[pid]/status.
 func (t *Task) SeccompMode() int {
-	f := t.syscallFilters.Load()
-	if f != nil && len(f.([]bpf.Program)) > 0 {
+	f := t.seccomp.Load()
+	if f != nil && len(f.(*taskSeccomp).filters) > 0 {
 		return linux.SECCOMP_MODE_FILTER
 	}
 	return linux.SECCOMP_MODE_NONE
