@@ -655,6 +655,7 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 	// by itself. Calling `setrlimit` here will have the side-effect of setting
 	// the limit on the currently-running `runsc` process as well, but that
 	// should be OK too.
+	// 1.消除内存的资源限制
 	var rlim unix.Rlimit
 	if err := unix.Getrlimit(unix.RLIMIT_MEMLOCK, &rlim); err != nil {
 		log.Warningf("Failed to get RLIMIT_MEMLOCK: %v", err)
@@ -672,6 +673,7 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 	//
 
 	// Open the log files to pass to the sandbox as FDs.
+	// 2.打开日志文件 只传递给sandbox文件ID
 	if err := donations.OpenAndDonate("log-fd", conf.LogFilename, os.O_CREATE|os.O_WRONLY|os.O_APPEND); err != nil {
 		return err
 	}
@@ -703,7 +705,7 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 	if err := donations.DonateDebugLogFile("profiling-metrics-fd", conf.ProfilingMetricsLog, "metrics", test); err != nil {
 		return err
 	}
-
+	// 一系列的 DebugLogFile 配置完成
 	// Relay all the config flags to the sandbox process.
 	cmd := exec.Command(specutils.ExePath, conf.ToFlags()...)
 	cmd.SysProcAttr = &unix.SysProcAttr{
@@ -765,6 +767,7 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 	cmd.Args = append(cmd.Args, "--overlay-mediums="+args.OverlayMediums.String())
 
 	// Create a socket for the control server and donate it to the sandbox.
+	// 3 创建socket文件
 	controlSocketPath, sockFD, err := createControlSocket(conf.RootDir, s.ID)
 	if err != nil {
 		return fmt.Errorf("failed to create control socket: %v", err)
@@ -783,7 +786,7 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 		return err
 	}
 	donations.DonateAndClose("sink-fds", args.SinkFiles...)
-
+	// 4 Platform 设置
 	gPlatform, err := platform.Lookup(conf.Platform)
 	if err != nil {
 		return fmt.Errorf("cannot look up platform: %w", err)
@@ -815,6 +818,7 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 	if gPlatform.Requirements().RequiresCurrentPIDNS {
 		// TODO(b/75837838): Also set a new PID namespace so that we limit
 		// access to other host processes.
+		// 根据Platform进行设置
 		log.Infof("Sandbox will be started in the current PID namespace")
 	} else {
 		log.Infof("Sandbox will be started in a new PID namespace")
@@ -825,6 +829,7 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 	// Joins the network namespace if network is enabled. the sandbox talks
 	// directly to the host network, which may have been configured in the
 	// namespace.
+	// 5.网络模式的设定
 	if ns, ok := specutils.GetNS(specs.NetworkNamespace, args.Spec); ok && conf.Network != config.NetworkNone {
 		log.Infof("Sandbox will be started in the container's network namespace: %+v", ns)
 		nss = append(nss, ns)
@@ -846,7 +851,9 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 	// configured.
 	rootlessEUID := unix.Geteuid() != 0
 	setUserMappings := false
+	// 6.容器的user namespace设置，包含了uid_mapping
 	if conf.Network == config.NetworkHost || conf.DirectFS {
+		// 在容器的 user namespace 启动
 		if userns, ok := specutils.GetNS(specs.UserNamespace, args.Spec); ok {
 			log.Infof("Sandbox will be started in container's user namespace: %+v", userns)
 			nss = append(nss, userns)
@@ -939,6 +946,7 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 	// be connected to the same FDs, otherwise we risk leaking sandbox
 	// errors to the application, so we set the sandbox stdio to nil,
 	// causing them to read/write from the null device.
+	// 7 标准输入输出的设定
 	cmd.Stdin = nil
 	cmd.Stdout = nil
 	cmd.Stderr = nil
@@ -1065,6 +1073,7 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 	donation.LogDonations(cmd)
 	log.Debugf("Starting sandbox: %s %v", cmd.Path, cmd.Args)
 	log.Debugf("SysProcAttr: %+v", cmd.SysProcAttr)
+	// 8 启动
 	if err := specutils.StartInNS(cmd, nss); err != nil {
 		err := fmt.Errorf("starting sandbox: %v", err)
 		// If the sandbox failed to start, it may be because the binary
