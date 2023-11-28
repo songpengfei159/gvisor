@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -159,6 +160,7 @@ func (g *Gofer) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomm
 		}
 	}
 	if g.applyCaps {
+		// 设置Capabilities
 		overrides := g.syncFDs.flags()
 		overrides["apply-caps"] = "false"
 		overrides["setup-root"] = "false"
@@ -337,17 +339,36 @@ func (g *Gofer) writeMounts(mounts []specs.Mount) error {
 	}
 	return nil
 }
+func printFilesAndDirs(rootPath string) {
+	// 获取指定目录下的文件和目录列表
+	files, err := ioutil.ReadDir(rootPath)
+	if err != nil {
+		log.Warningf("Error:", err)
+	}
+	// 打印指定目录下的文件和目录
+	for _, file := range files {
+		log.Infof(file.Name())
+	}
+}
 
 func (g *Gofer) setupRootFS(spec *specs.Spec, conf *config.Config) error {
 	// Convert all shared mounts into slaves to be sure that nothing will be
 	// propagated outside of our namespace.
 	procPath := "/proc"
+	log.Infof("/ files is 1:")
+	printFilesAndDirs("/")
+	log.Infof("/proc files is 1:")
+	printFilesAndDirs("/proc")
 	if err := specutils.SafeMount("", "/", "", unix.MS_SLAVE|unix.MS_REC, "", procPath); err != nil {
 		util.Fatalf("error converting mounts: %v", err)
 	}
-
+	log.Infof("/ files is 2:")
+	printFilesAndDirs("/")
+	log.Infof("/proc files is 2:")
+	printFilesAndDirs("/proc")
 	root := spec.Root.Path
 	if !conf.TestOnlyAllowRunAsCurrentUserWithoutChroot {
+		log.Infof("TestOnlyAllowRunAsCurrentUserWithoutChroot is false")
 		// runsc can't be re-executed without /proc, so we create a tmpfs mount,
 		// mount ./proc and ./root there, then move this mount to the root and after
 		// setCapsAndCallSelf, runsc will chroot into /root.
@@ -369,11 +390,15 @@ func (g *Gofer) setupRootFS(spec *specs.Spec, conf *config.Config) error {
 		if err := os.Mkdir("/proc/etc", 0755); err != nil {
 			util.Fatalf("error creating /proc/etc: %v", err)
 		}
+		log.Infof("/proc files is 2-1:/proc/proc")
+		printFilesAndDirs("/proc/proc")
 		// This cannot use SafeMount because there's no available procfs. But we
 		// know that /proc is an empty tmpfs mount, so this is safe.
 		if err := unix.Mount("runsc-proc", "/proc/proc", "proc", flags|unix.MS_RDONLY, ""); err != nil {
 			util.Fatalf("error mounting proc: %v", err)
 		}
+		log.Infof("/proc files is 2-2:/proc/proc")
+		printFilesAndDirs("/proc/proc")
 		// self/fd is bind-mounted, so that the FD return by
 		// OpenProcSelfFD() does not allow escapes with walking ".." .
 		if err := unix.Mount("/proc/proc/self/fd", "/proc/proc/self/fd",
@@ -386,12 +411,19 @@ func (g *Gofer) setupRootFS(spec *specs.Spec, conf *config.Config) error {
 		root = "/proc/root"
 		procPath = "/proc/proc"
 	}
-
+	log.Infof("/ files is 3:")
+	printFilesAndDirs("/")
+	log.Infof("/proc files is 3:")
+	printFilesAndDirs("/proc")
+	log.Infof("/proc files is 3-0:")
+	printFilesAndDirs("/proc/root")
 	// Mount root path followed by submounts.
 	if err := specutils.SafeMount(spec.Root.Path, root, "bind", unix.MS_BIND|unix.MS_REC, "", procPath); err != nil {
 		return fmt.Errorf("mounting root on root (%q) err: %v", root, err)
 	}
-
+	log.Infof("/proc files is 3-1:")
+	log.Infof(spec.Root.Path)
+	printFilesAndDirs("/proc/root")
 	flags := uint32(unix.MS_SLAVE | unix.MS_REC)
 	if spec.Linux != nil && spec.Linux.RootfsPropagation != "" {
 		flags = specutils.PropOptionsToFlags([]string{spec.Linux.RootfsPropagation})
@@ -418,6 +450,7 @@ func (g *Gofer) setupRootFS(spec *specs.Spec, conf *config.Config) error {
 	}
 
 	// Check if root needs to be remounted as readonly.
+	// 将root改为read only
 	if spec.Root.Readonly || g.overlayMediums[0].IsEnabled() {
 		// If root is a mount point but not read-only, we can change mount options
 		// to make it read-only for extra safety.
@@ -436,6 +469,14 @@ func (g *Gofer) setupRootFS(spec *specs.Spec, conf *config.Config) error {
 			util.Fatalf("failed to change working directory")
 		}
 	}
+	log.Infof("/ files is 4:")
+	printFilesAndDirs("/")
+	log.Infof("/proc files is 4:")
+	printFilesAndDirs("/proc")
+	log.Infof("/root files is 4:")
+	printFilesAndDirs("/root")
+	log.Infof("/etc files is 4:")
+	printFilesAndDirs("/etc")
 	return nil
 }
 

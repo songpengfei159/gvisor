@@ -43,6 +43,7 @@ func mountInChroot(chroot, src, dst, typ string, flags uint32) error {
 }
 
 func pivotRoot(root string) error {
+	// 1 改变当前工作目录
 	if err := os.Chdir(root); err != nil {
 		return fmt.Errorf("error changing working directory: %v", err)
 	}
